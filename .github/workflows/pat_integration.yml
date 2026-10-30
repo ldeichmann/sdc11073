@@ -1,0 +1,42 @@
+name: Run PAT tests
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ opened, synchronize, reopened, ready_for_review ]
+  push:
+    branches:
+      - master
+      - v*
+
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes its running PAT tests; pushes to branches run per commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sdc11073_provider_v2:
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, macos-14, windows-latest ]
+        tls_enable: [ true, false ]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run tests with tls ${{ matrix.tls_enable && 'enabled' || 'disabled' }}
+        run: uv run -m pat.run ${{ matrix.tls_enable && '--tls' || '' }}
+        timeout-minutes: 2

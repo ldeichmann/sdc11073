@@ -1,131 +1,234 @@
-import threading
-import logging
-import os.path
-import urllib
-from sdc11073.pysoap.soapenvelope import Soap12Envelope, DPWSThisModel, DPWSThisDevice
-from sdc11073.sdcdevice.subscriptionmgr import _DevSubscription
-from sdc11073.mdib import DeviceMdibContainer
-from sdc11073 import namespaces
-from sdc11073 import pmtypes
+"""The module implements classes needed for testing.
 
-from sdc11073.sdcdevice import  SdcDevice
-from lxml import etree as etree_
-portsLock = threading.Lock()
+It contains simplified replacements for WsDiscovery and Subscription on devices side.
+It also contains SdcProvider implementations that simplify the instantiation of a device.
+"""
+
+from __future__ import annotations
+
+import logging
+import pathlib
+import threading
+from decimal import Decimal
+from typing import TYPE_CHECKING
+from urllib.parse import SplitResult
+
+from lxml import etree
+from tutorial.productandroles.exampleproduct import EXAMPLE_ROLE_PROVIDER_COMPONENTS
+
+from sdc11073.mdib import ProviderMdib
+from sdc11073.namespaces import default_ns_helper as ns_hlp
+from sdc11073.provider import SdcProvider
+from sdc11073.provider.subscriptionmgr import BicepsSubscription
+from sdc11073.xml_types import pm_qnames as pm
+from sdc11073.xml_types import pm_types
+from sdc11073.xml_types.addressing_types import HeaderInformationBlock
+from sdc11073.xml_types.dpws_types import ThisDeviceType, ThisModelType
+from sdc11073.xml_types.eventing_types import Subscribe, SubscriptionEndStatus
+
+if TYPE_CHECKING:
+    import ipaddress
+    import uuid
+
+    import sdc11073.certloader
+    from sdc11073.provider.providerimpl import RoleProviderComponents, SdcProviderComponents, WsDiscoveryProtocol
+    from sdc11073.pysoap.msgfactory import MessageFactory
+    from sdc11073.pysoap.soapclientpool import SoapClientPool
+    from sdc11073.xml_utils import LxmlElement
+ports_lock = threading.Lock()
 _ports = 10000
 
 _mockhttpservers = {}
 
 _logger = logging.getLogger('sdc.mock')
 
-def resetModule():
-    global _ports
-    _mockhttpservers.clear()
-    _ports = 10000
 
-def _findServer(netloc):
-    dev_addr = netloc.split(':')
-    dev_addr = tuple([dev_addr[0], int(dev_addr[1])]) # make port number an integer
-    for key, srv in _mockhttpservers.items():
-        if tuple(key) == dev_addr:
-            return srv
-    raise KeyError('{} is not in {}'.format(dev_addr, _mockhttpservers.keys() ))
+def dec_list(*args: float | str) -> list[Decimal]:
+    """Convert a list of numbers to decimal."""
+    return [Decimal(x) for x in args]
 
 
+class MockWsDiscovery:
+    """Implementation of a minimal WsDiscovery interface.
 
-class MockWsDiscovery(object):
-    def __init__(self, ipaddresses):
-        self._ipaddresses = ipaddresses
-    
-    def getActiveAddresses(self):
-        return self._ipaddresses
+    The class does nothing except logging.
+    """
 
-    def clearService(self, epr):
-        _logger.info ('clearService "{}"'.format(epr))
+    def __init__(self, ipaddress: str | ipaddress.IPv4Address):
+        self._ipaddress = ipaddress
+
+    @property
+    def active_address(self) -> str:
+        """Return the ip address."""
+        return self._ipaddress
+
+    def clear_service(self, epr: str):
+        """Clear services."""
+        _logger.info('clear_service "%r"', epr)
 
 
+class TestDevSubscription(BicepsSubscription):
+    """Can be used instead of real Subscription objects."""
 
-class TestDevSubscription(_DevSubscription):
-    ''' Can be used instead of real Subscription objects'''
     mode = 'SomeMode'
-    notifyTo = 'http://self.com:123'
+    notify_to = 'http://self.com:123'
     identifier = '0815'
     expires = 60
-    notifyRef = 'a ref string'
-    def __init__(self, filter_, bicepsSchema):
-        notifyRefNode = etree_.Element(namespaces.wseTag('References'))
-        identNode = etree_.SubElement(notifyRefNode, namespaces.wseTag('Identifier'))
-        identNode.text = self.notifyRef
-        base_urls = [ urllib.parse.SplitResult('https', 'www.example.com:222', 'no_uuid', query=None, fragment=None)]
+    notify_ref = 'a ref string'
 
-        super(TestDevSubscription, self).__init__(mode=self.mode, 
-                                                  notifyToAddress=self.notifyTo, 
-                                                  notifyRefNode=notifyRefNode,
-                                                  endToAddress=None,
-                                                  endToRefNode=None,
-                                                  expires=self.expires,
-                                                  max_subscription_duration=42,
-                                                  filter_=filter_,
-                                                  sslContext=None,
-                                                  bicepsSchema=bicepsSchema,
-                                                  acceptedEncodings=None,
-                                                  base_urls=base_urls)
+    def __init__(
+        self,
+        filter_: list[str],
+        soap_client_pool: SoapClientPool,
+        msg_factory: MessageFactory,
+        test_nbr_reports: int = 1,
+    ):
+        notify_ref_node = etree.Element(ns_hlp.WSE.tag('References'))
+        ident_node = etree.SubElement(notify_ref_node, ns_hlp.WSE.tag('Identifier'))
+        ident_node.text = self.notify_ref
+        base_urls = [SplitResult('https', 'www.example.com:222', 'no_uuid', query=None, fragment=None)]
+        accepted_encodings = ['foo']  # not needed here
+        subscribe_request = Subscribe()
+        subscribe_request.set_filter(' '.join(filter_))
+        subscribe_request.Delivery.NotifyTo.Address = self.notify_to
+        subscribe_request.Delivery.NotifyTo.ReferenceParameters = [notify_ref_node]
+        subscribe_request.Delivery.NotifyTo.Mode = self.mode
+        max_subscription_duration = 42
+        subscr_mgr = None
+        super().__init__(
+            subscr_mgr,
+            subscribe_request,
+            accepted_encodings,
+            base_urls,
+            max_subscription_duration,
+            soap_client_pool,
+            msg_factory=msg_factory,
+            log_prefix='test',
+        )
         self.reports = []
-        self.bmmSchema = bicepsSchema.bmmSchema
-        
-        
-    def sendNotificationReport(self, bodyNode, action, doc_nsmap):
-        soapEnvelope = Soap12Envelope(doc_nsmap)
-        soapEnvelope.addBodyElement(bodyNode)
-        rep = self._mkNotificationReport(soapEnvelope, action)
-        try:
-            rep.validateBody(self.bmmSchema)
-        except:
-            print (rep.as_xml(pretty=True))
-            raise
-        self.reports.append(rep)
+        self._test_nbr_reports = test_nbr_reports
+        self.reports_event = threading.Event()
+
+    def send_notification_report(self, body_node: LxmlElement, action: str):
+        """Send notification to subscriber."""
+        info_block = HeaderInformationBlock(
+            action=action,
+            addr_to=self.notify_to_address,
+            reference_parameters=self.notify_ref_params,
+        )
+        message = self._mk_notification_message(info_block, body_node)
+        self.reports.append(message)
+        if len(self.reports) >= self._test_nbr_reports:
+            self.reports_event.set()
+
+    async def async_send_notification_report(self, body_node: LxmlElement, action: str):
+        """Send notification to subscriber."""
+        info_block = HeaderInformationBlock(
+            action=action,
+            addr_to=self.notify_to_address,
+            reference_parameters=self.notify_ref_params,
+        )
+        message = self._mk_notification_message(info_block, body_node)
+        self.reports.append(message)
+        if len(self.reports) >= self._test_nbr_reports:
+            self.reports_event.set()
+
+    async def async_send_notification_end_message(
+        self,
+        code: str = SubscriptionEndStatus.SOURCE_SHUTTING_DOWN,
+        reason: str = 'Event source going off line.',
+    ):
+        """Do nothing.
+
+        Implementation not needed for tests.
+        """
 
 
-class SomeDevice(SdcDevice):
-    """A device used for unit tests
+class SomeDevice(SdcProvider):
+    """A device used for unit tests. Some values are predefined."""
 
-    """
-    def __init__(self, wsdiscovery, my_uuid, mdib_xml_string,
-                 validate=True, sslContext=None, logLevel=logging.INFO, log_prefix='',
-                 chunked_messages=False):
-        model = DPWSThisModel(manufacturer='Draeger CoC Systems',
-                              manufacturerUrl='www.draeger.com',
-                              modelName='SomeDevice',
-                              modelNumber='1.0',
-                              modelUrl='www.draeger.com/whatever/you/want/model',
-                              presentationUrl='www.draeger.com/whatever/you/want/presentation')
-        device = DPWSThisDevice(friendlyName='Py SomeDevice',
-                                firmwareVersion='0.99',
-                                serialNumber='12345')
-#        log_prefix = '' if not ident else '<{}>:'.format(ident)
-        deviceMdibContainer = DeviceMdibContainer.fromString(mdib_xml_string, log_prefix=log_prefix)
+    def __init__(  # noqa: PLR0913, PLR0917
+        self,
+        wsdiscovery: WsDiscoveryProtocol,
+        mdib_xml_data: bytes,
+        epr: str | uuid.UUID | None = None,
+        validate: bool = True,
+        ssl_context_container: sdc11073.certloader.SSLContextContainer | None = None,
+        max_subscription_duration: int = 15,
+        log_prefix: str = '',
+        components: SdcProviderComponents | None = None,
+        role_provider_components: RoleProviderComponents | None = EXAMPLE_ROLE_PROVIDER_COMPONENTS,
+        chunk_size: int = 0,
+        alternative_hostname: str | None = None,
+    ):
+        model = ThisModelType(
+            manufacturer='Example Manufacturer',
+            manufacturer_url='www.example-manufacturer.com',
+            model_name='SomeDevice',
+            model_number='1.0',
+            model_url='www.example-manufacturer.com/whatever/you/want/model',
+            presentation_url='www.example-manufacturer.com/whatever/you/want/presentation',
+        )
+        device = ThisDeviceType(friendly_name='Py SomeDevice', firmware_version='0.99', serial_number='12345')
+
+        device_mdib_container = ProviderMdib.from_string(
+            mdib_xml_data,
+            log_prefix=log_prefix,
+        )
+        device_mdib_container.instance_id = 1  # set the optional value
         # set Metadata
-        mdsDescriptor = deviceMdibContainer.descriptions.NODETYPE.getOne(namespaces.domTag('MdsDescriptor'))
-        mdsDescriptor.Manufacturer.append(pmtypes.LocalizedText(u'Dräger'))
-        mdsDescriptor.ModelName.append(pmtypes.LocalizedText(model.modelName[None]))
-        mdsDescriptor.SerialNumber.append(pmtypes.ElementWithTextOnly('ABCD-1234'))
-        mdsDescriptor.ModelNumber = '0.99'
-        mdsDescriptor.updateNode()
-        super(SomeDevice, self).__init__(wsdiscovery, my_uuid, model, device, deviceMdibContainer, validate,
-                                         # registerDefaultOperations=True,
-                                         sslContext=sslContext, logLevel=logLevel, log_prefix=log_prefix,
-                                         chunked_messages=chunked_messages)
-        #self._handler.mkDefaultRoleHandlers()
-    @classmethod
-    def fromMdibFile(cls, wsdiscovery, my_uuid, mdib_xml_path,
-                 validate=True, sslContext=None, logLevel=logging.INFO, log_prefix='', chunked_messages=False):
-        """
-        An alternative constructor for the class
-        """
-        if not os.path.isabs(mdib_xml_path):
-            here = os.path.dirname(__file__)
-            mdib_xml_path = os.path.join(here, mdib_xml_path)
+        mds_descriptors = device_mdib_container.descriptions.NODETYPE.get(pm.MdsDescriptor)
+        for mds_descriptor in mds_descriptors:
+            if mds_descriptor.MetaData is not None:
+                mds_descriptor.MetaData.Manufacturer.append(pm_types.LocalizedText('Example Manufacturer'))
+                mds_descriptor.MetaData.ModelName.append(pm_types.LocalizedText(model.ModelName[0].text))
+                mds_descriptor.MetaData.SerialNumber.append('ABCD-1234')
+                mds_descriptor.MetaData.ModelNumber = '0.99'
+        super().__init__(
+            wsdiscovery,
+            model,
+            device,
+            device_mdib_container,
+            epr,
+            validate,
+            ssl_context_container=ssl_context_container,
+            max_subscription_duration=max_subscription_duration,
+            log_prefix=log_prefix,
+            components=components,
+            role_provider_components=role_provider_components,
+            chunk_size=chunk_size,
+            alternative_hostname=alternative_hostname,
+        )
 
-        with open(mdib_xml_path, 'rb') as f:
-            mdib_xml_string = f.read()
-        return cls(wsdiscovery, my_uuid, mdib_xml_string, validate, sslContext, logLevel, log_prefix=log_prefix,
-                   chunked_messages=chunked_messages)
+    @classmethod
+    def from_mdib_file(  # noqa: PLR0913, PLR0917
+        cls,
+        wsdiscovery: WsDiscoveryProtocol,
+        epr: str | uuid.UUID | None,
+        mdib_xml_path: str | pathlib.Path,
+        validate: bool = True,
+        ssl_context_container: sdc11073.certloader.SSLContextContainer | None = None,
+        max_subscription_duration: int = 15,
+        log_prefix: str = '',
+        components: SdcProviderComponents | None = None,
+        role_provider_components: RoleProviderComponents | None = EXAMPLE_ROLE_PROVIDER_COMPONENTS,
+        chunk_size: int = 0,
+        alternative_hostname: str | None = None,
+    ) -> SomeDevice:
+        """Construct class with path to a mdib file."""
+        mdib_xml_path = pathlib.Path(mdib_xml_path)
+        if not mdib_xml_path.is_absolute():
+            mdib_xml_path = pathlib.Path(__file__).parent.joinpath(mdib_xml_path)
+        return cls(
+            wsdiscovery,
+            mdib_xml_path.read_bytes(),
+            epr,
+            validate,
+            ssl_context_container,
+            max_subscription_duration=max_subscription_duration,
+            log_prefix=log_prefix,
+            components=components,
+            role_provider_components=role_provider_components,
+            chunk_size=chunk_size,
+            alternative_hostname=alternative_hostname,
+        )

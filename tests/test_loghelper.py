@@ -1,27 +1,33 @@
-import unittest
+"""Tests for loghelper."""
+
 import logging
+import unittest
+import uuid
+from typing import Any
+from unittest import mock
+
 from sdc11073 import loghelper
 
 
+def _run_test_cm(logger, level):  # noqa: ANN001
+    with loghelper.LogWatcher(logger, level):
+        logger.debug('123')
+        logger.info('234')
+        logger.warning('345')
+
+
 class TestLogWatcher(unittest.TestCase):
-
-    def _runtest_CM(self, logger, level):
-        with loghelper.LogWatcher(logger, level) as w:
-            logger.debug('123')
-            logger.info('234')
-            logger.warning('345')
-
     def test_logwatcher_contextmanager(self):
         logger = logging.getLogger('TestLogWatcher_CM')
         logger.setLevel(logging.DEBUG)
-        self._runtest_CM(logger, logging.ERROR) # no exception
-        self.assertRaises(loghelper.LogWatchException, self._runtest_CM, logger, logging.WARN)
+        _run_test_cm(logger, logging.ERROR)  # no exception
+        self.assertRaises(loghelper.LogWatchError, _run_test_cm, logger, logging.WARNING)
         try:
-            exc = self._runtest_CM(logger, logging.INFO)
-        except loghelper.LogWatchException as ex:
+            _run_test_cm(logger, logging.INFO)
+        except loghelper.LogWatchError as ex:
             self.assertEqual(len(ex.issues), 2)
             for e in ex.issues:
-                print (e)
+                print(e)
         else:
             self.fail('LogWatchException not raised')
 
@@ -38,10 +44,22 @@ class TestLogWatcher(unittest.TestCase):
         logger.debug('123')
         logger.info('234')
         lw2.setPaused(True)
-        logger.warning('345') # shall not be handled, because paused
+        logger.warning('345')  # shall not be handled, because paused
         lw2.check(stop=False)
         lw2.setPaused(False)
-        logger.warning('456')# shall be handle
+        logger.warning('456')
         records = lw2.getAllRecords()
         self.assertEqual(len(records), 1)
-        self.assertRaises(loghelper.LogWatchException, lw2.check)
+        self.assertRaises(loghelper.LogWatchError, lw2.check)
+
+    def test_ident_parameter(self):
+        def _test_prefix(prefix: Any):
+            adapter = loghelper.LoggerAdapter(logger=mock.MagicMock(), prefix=prefix)
+            msg = uuid.uuid4()
+            processed_msg = adapter._process(msg, (), ())
+            self.assertEqual(f'{prefix or ""}{msg}', processed_msg)
+
+        _test_prefix(1)
+        _test_prefix('1')
+        _test_prefix(mock.MagicMock())
+        _test_prefix(None)

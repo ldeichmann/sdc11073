@@ -1,0 +1,174 @@
+"""Test SoapClient - e.g. error handling."""
+
+import ssl
+from http.client import HTTPException, NotConnected
+from unittest import TestCase, mock
+
+from sdc11073.consumer.consumerimpl import SdcConsumer
+from sdc11073.definitions_sdc import SdcV1Definitions
+from sdc11073.loghelper import get_logger_adapter
+from sdc11073.pysoap.msgfactory import MessageFactory
+from sdc11073.pysoap.msgreader import MessageReader, ReceivedMessage
+from sdc11073.pysoap.soapclient import HTTPReturnCodeError, SoapClient
+from sdc11073.xml_types.addressing_types import HeaderInformationBlock
+from sdc11073.xml_types.eventing_types import Renew, RenewResponse
+
+
+class TestSoapClient(TestCase):
+    """Test error handling of SoapClient."""
+
+    def setUp(self):
+        """Create the soap client used in the test."""
+        self.logger = get_logger_adapter('test')
+
+        self.soap_client = SoapClient(
+            netloc='127.0.0.1:9999',
+            socket_timeout=10,
+            logger=self.logger,
+            ssl_context=None,
+            sdc_definitions=SdcV1Definitions,
+            msg_reader=MessageReader(SdcV1Definitions, None, self.logger, validate=False),
+        )
+
+    def test_get_from_url(self):
+        """Check error handling of get_from_url method."""
+        body = b''  # body content relevant in this test
+        self._setup_mock(body)
+
+        # normal call, no exception
+        self.soap_client.get_from_url('foo', msg='')
+
+        # http connection raises an exception => exception is delegated to caller
+        for exception in (HTTPException('mock'), OSError('mock'), Exception('mock')):
+            mocked_connection, _ = self._setup_mock(body)
+
+            mocked_connection.getresponse.side_effect = exception
+            self.assertRaises(exception.__class__, self.soap_client.get_from_url, 'foo', '')
+            self.assertFalse(self.soap_client.is_closed())
+
+    def test_post_message_to(self):
+        """Check error handling of post_message_to method."""
+        # create a message to be sent
+        factory = MessageFactory(SdcV1Definitions, None, self.logger)
+        inf = HeaderInformationBlock(action='some_action', addr_to='does_not_matter')
+        payload = Renew()
+        created_message = factory.mk_soap_message(inf, payload)
+
+        # create a message to be received
+        factory = MessageFactory(SdcV1Definitions, None, get_logger_adapter('mock'))
+        payload = RenewResponse()
+        payload.Expires = 10
+        inf = HeaderInformationBlock(action='some_action', addr_to='does_not_matter')
+        returned_message = factory.mk_soap_message(inf, payload)
+        body = returned_message.serialize()
+
+        # mock the connection
+        self._setup_mock(body)
+
+        # normal call, no exception
+        result = self.soap_client.post_message_to('renew', created_message, validate=False)
+        self.assertIsInstance(result, ReceivedMessage)
+        self.assertFalse(self.soap_client.is_closed())
+
+        # request method of http connection raises an Exception => exception is converted to NotConnected,
+        # keeping the original exception as reason (message) and cause (__cause__).
+        for exception in (HTTPException('mock'), OSError('mock'), Exception('mock')):
+            mocked_connection, http_response = self._setup_mock(body)
+            mocked_connection.request.side_effect = exception
+            with self.assertRaises(NotConnected) as ctx:
+                self.soap_client.post_message_to('renew', created_message, validate=False)
+            self.assertIn('mock', str(ctx.exception))
+            self.assertIn(exception.__class__.__name__, str(ctx.exception))
+            self.assertIs(ctx.exception.__cause__, exception)
+            self.assertTrue(self.soap_client.is_closed())
+
+        # getresponse method of http connection raises an Exception => exception is converted to NotConnected,
+        # keeping the original exception as reason (message) and cause (__cause__).
+        for exception in (HTTPException('mock'), OSError('mock'), Exception('mock')):
+            mocked_connection, http_response = self._setup_mock(body)
+            mocked_connection.getresponse.side_effect = exception
+            with self.assertRaises(NotConnected) as ctx:
+                self.soap_client.post_message_to('renew', created_message, validate=False)
+            self.assertIn('mock', str(ctx.exception))
+            self.assertIn(exception.__class__.__name__, str(ctx.exception))
+            self.assertIs(ctx.exception.__cause__, exception)
+            self.assertTrue(self.soap_client.is_closed())
+
+        # returned status >= 300 => raise HTTPReturnCodeError, connection stays open
+        mocked_connection, http_response = self._setup_mock(body)
+        http_response.status = 333
+        self.assertRaises(
+            HTTPReturnCodeError,
+            self.soap_client.post_message_to,
+            'renew',
+            created_message,
+            validate=False,
+        )
+        self.assertFalse(self.soap_client.is_closed())
+
+    def _setup_mock(self, body: bytes) -> tuple[mock.MagicMock, mock.MagicMock]:
+        """Mock self.soap_client._http_connection.
+
+        The mock returns a mocked HttpResponse with body as data on getresponse() call.
+        Return the mocked connection and the mocked http response, so that they can be manipulated in test.
+        """
+        mocked_connection = mock.MagicMock()
+        http_response = mock.MagicMock()
+        http_response.status = 200
+        http_response.getheader.side_effect = [f'{len(body)}', None]  # content length, transfer-encoding
+        http_response.read.return_value = body
+        mocked_connection.getresponse.return_value = http_response
+        self.soap_client._http_connection = mocked_connection
+        self.soap_client._has_connection_error = False
+        return mocked_connection, http_response
+
+    def test_prepare_message(self):
+        """Test the _prepare_message method."""
+        created_message = mock.MagicMock()
+
+        request_manipulator = mock.MagicMock()
+        request_manipulator.manipulate_soapenvelope = mock.MagicMock()
+        return_value = self.soap_client._prepare_message(
+            created_message=created_message,
+            request_manipulator=request_manipulator,
+            validate=True,
+        )
+
+        created_message.serialize.assert_called_once_with(request_manipulator=request_manipulator, validate=False)
+        self.assertTrue(request_manipulator.manipulate_string.called)
+        self.assertEqual(return_value, request_manipulator.manipulate_string.return_value)
+
+    def test_connect_ssl_fallback_logs_reason(self):
+        """When auto-detect falls back from ssl to non-ssl, the ssl error reason is logged (see issue #427)."""
+        consumer = SdcConsumer(
+            'https://127.0.0.1:9999',  # exact value does not matter
+            sdc_definitions=SdcV1Definitions,
+            ssl_context_container=None,
+            validate=False,
+        )
+        # ssl_context_container=None sets is_ssl_connection=False; force auto-detect so the ssl attempt runs first
+        consumer.is_ssl_connection = None
+        consumer._logger = mock.MagicMock()
+
+        ssl_error = ssl.SSLError('certificate verify failed')
+        ssl_soap_client = mock.MagicMock()
+        ssl_soap_client.connect.side_effect = ssl_error  # ssl attempt fails
+        plain_soap_client = mock.MagicMock()  # non-ssl retry succeeds
+
+        consumer.get_soap_client = mock.MagicMock(side_effect=[ssl_soap_client, plain_soap_client])
+        consumer._forget_soap_client = mock.MagicMock()
+
+        consumer._connect()
+
+        # fell back to a non-ssl connection ...
+        self.assertFalse(consumer.is_ssl_connection)
+        # ... and the swallowed ssl error was made visible via a warning that carries the reason
+        consumer._logger.warning.assert_called_once()
+        self.assertIn(ssl_error, consumer._logger.warning.call_args.args)
+
+    def test_get_from_url_raises_not_connected_error(self):
+        """Test that get_from_url raises NotConnected when the connection is closed."""
+        self.soap_client.connect = mock.MagicMock()
+        with self.assertRaises(NotConnected, msg=f'not connected to {self.soap_client._netloc}'):
+            self.soap_client.get_from_url('foo', msg='')
+        self.soap_client.connect.assert_called_once()  # tried to reconnect once

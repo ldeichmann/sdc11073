@@ -1,0 +1,126 @@
+"""Test alert delegation and a role-provider that implements alert delegation acc. to BICEPS chapter 6.2."""
+
+import logging
+import sys
+import threading
+import unittest
+
+from sdc11073 import loghelper
+from sdc11073.consumer.consumerimpl import SdcConsumer
+from sdc11073.mdib.consumermdib import ConsumerMdib
+from sdc11073.mdib.statecontainers import AbstractAlertStateContainer
+from sdc11073.observableproperties import observables
+from sdc11073.wsdiscovery import WSDiscovery
+from sdc11073.xml_types import msg_types, pm_types
+from sdc11073.xml_types.actions import periodic_actions
+from tests import utils
+from tests.mockstuff import SomeDevice
+
+CLIENT_VALIDATE = True
+SET_TIMEOUT = 10  # longer timeout than usually needed, but jenkins jobs frequently failed with 3 seconds timeout
+NOTIFICATION_TIMEOUT = 5  # also jenkins related value
+
+
+class TestClientSomeDeviceAlertDelegate(unittest.TestCase):
+    """Test alert delegation and a role-provider that implements alert delegation acc. to BICEPS chapter 6.2."""
+
+    def setUp(self):
+        loghelper.basic_logging_setup()
+        logging.getLogger('sdc').info('############### start setUp %s ##############', self._testMethodName)
+        self.wsd = WSDiscovery('127.0.0.1', multicast_port=utils.wsd_port())
+        self.wsd.start()
+        self.sdc_device = SomeDevice.from_mdib_file(self.wsd, None, 'mdib_two_mds.xml', log_prefix='<device> ')
+        self.sdc_device.start_all()
+        self._loc_validators = [pm_types.InstanceIdentifier('Validator', extension_string='System')]
+        self.sdc_device.mdib.xtra.ensure_location_context_descriptor()
+        self.sdc_device.set_location(
+            utils.random_location(),
+            self._loc_validators,
+            location_context_descriptor_handle='LC.mds0',
+        )
+
+        x_addr = self.sdc_device.get_xaddrs()
+        self.sdc_client = SdcConsumer(
+            x_addr[0],
+            sdc_definitions=self.sdc_device.mdib.sdc_definitions,
+            ssl_context_container=None,
+            validate=CLIENT_VALIDATE,
+            log_prefix='<client> ',
+        )
+        self.sdc_client.start_all(not_subscribed_actions=periodic_actions)
+        logging.getLogger('sdc').info('############### setUp done %s ##############', self._testMethodName)
+        self.log_watcher = loghelper.LogWatcher(logging.getLogger('sdc'), level=logging.ERROR)
+
+    def tearDown(self):
+        logging.getLogger('sdc').info('############### tearDown %s... ##############', self._testMethodName)
+        self.log_watcher.setPaused(True)
+        self.sdc_client.stop_all()
+        self.sdc_device.stop_all()
+        self.wsd.stop()
+        try:
+            self.log_watcher.check()
+        except loghelper.LogWatchError as ex:
+            sys.stderr.write(repr(ex))
+            raise
+        logging.getLogger('sdc').info('############### tearDown %s ############## done', self._testMethodName)
+
+    def test_basic_connect(self):
+        # simply check that all descriptors are available in client after init_mdib
+        cl_mdib = ConsumerMdib(self.sdc_client)
+        cl_mdib.init_mdib()
+        all_cl_handles = set(cl_mdib.descriptions.handle.keys())
+        all_dev_handles = set(self.sdc_device.mdib.descriptions.handle.keys())
+        self.assertEqual(all_cl_handles, all_dev_handles)
+        self.assertEqual(len(cl_mdib.states.objects), len(self.sdc_device.mdib.states.objects))
+
+    def test_delegate(self):
+        cl_mdib = ConsumerMdib(self.sdc_client)
+        cl_mdib.init_mdib()
+        as_handle = 'as0.mds0'
+        as_rem_handle = 'as0.mds0_rem'
+        # set an alarm condition and start local signal
+        with self.sdc_device.mdib.alert_state_transaction() as mgr:
+            alert_condition_state = mgr.get_state('ac0.mds0')
+            alert_condition_state.ActivationState = pm_types.AlertActivation.ON
+            alert_condition_state.Presence = True
+            local_alert_signal_state = mgr.get_state(as_handle)
+            local_alert_signal_state.ActivationState = pm_types.AlertActivation.ON
+            local_alert_signal_state.Presence = pm_types.AlertSignalPresence.ON
+        # verify that remote signal is still off
+        remote_alert_signal_state = self.sdc_device.mdib.states.descriptor_handle.get_one(as_rem_handle)
+        self.assertEqual(pm_types.AlertSignalPresence.OFF, remote_alert_signal_state.Presence)
+        self.assertEqual(pm_types.AlertActivation.OFF, remote_alert_signal_state.ActivationState)
+
+        # call activate method for delegate all alarms
+        proposed_alert_state = cl_mdib.xtra.mk_proposed_state(as_rem_handle)
+        proposed_alert_state.ActivationState = pm_types.AlertActivation.ON
+        proposed_alert_state.Presence = pm_types.AlertSignalPresence.ON
+
+        event1 = threading.Event()
+        event2 = threading.Event()
+
+        def _on_alert_update(update: dict[str, AbstractAlertStateContainer]):
+            if as_handle in update and as_rem_handle in update:
+                as_activation_1 = update[as_handle].ActivationState
+                as_activation_2 = update[as_rem_handle].ActivationState
+
+                if (
+                    as_activation_1 == pm_types.AlertActivation.PAUSED
+                    and as_activation_2 == pm_types.AlertActivation.ON
+                ):
+                    event1.set()
+
+                if (
+                    event1.is_set()
+                    and as_activation_1 == pm_types.AlertActivation.ON
+                    and as_activation_2 == pm_types.AlertActivation.OFF
+                ):
+                    event2.set()
+
+        with observables.bound_context(cl_mdib, alert_by_handle=_on_alert_update):
+            future = self.sdc_client.set_service_client.set_alert_state('as0.mds0_rem_dele', proposed_alert_state)
+            result = future.result(timeout=SET_TIMEOUT)
+            state = result.InvocationInfo.InvocationState
+            self.assertEqual(state, msg_types.InvocationState.FINISHED)
+            self.assertTrue(event1.wait(timeout=SET_TIMEOUT), msg='Remote alert signal was not sent.')
+            self.assertTrue(event2.wait(timeout=SET_TIMEOUT), msg='Remote alert signal was not unset automatically.')
